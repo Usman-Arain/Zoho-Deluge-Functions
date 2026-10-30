@@ -1,0 +1,168 @@
+void automation.create_account_from_lead(Int leadId)
+{
+// 1. Fetch Lead record details
+lead = zoho.crm.getRecordById("Leads",leadId);
+if(lead.get("id") != null)
+{
+	companyName = lead.get("Company");
+	// Skip Account creation if Company Name is null or empty
+	if(companyName == null || companyName == "")
+	{
+		info "Company Name is null or empty. Skipping Account creation for Lead ID: " + leadId;
+		return;
+	}
+	accountMap = Map();
+	// --- MANDATORY & IDENTIFIER FIELDS ---
+	accountMap.put("Account_Name",companyName);
+	accountMap.put("Corporate_Name",companyName);
+	// --- CONTACT & COMMUNICATION FIELDS ---
+	accountMap.put("Phone",lead.get("Phone"));
+	accountMap.put("Mobile",lead.get("Mobile"));
+	accountMap.put("WhatsApp_Number",lead.get("WhatsApp_Number"));
+	accountMap.put("Email",lead.get("Email"));
+	accountMap.put("Website",lead.get("Website"));
+	accountMap.put("Fax",lead.get("Fax"));
+	// --- COMPANY & INDUSTRY DETAILS ---
+	accountMap.put("Industry",lead.get("Industry"));
+	accountMap.put("Annual_Revenue",lead.get("Annual_Revenue"));
+	accountMap.put("Branches",lead.get("Branch"));
+	accountMap.put("Number_of_Delegates",lead.get("Number_of_Delegates"));
+	accountMap.put("Required_Corporate_Services",lead.get("Required_Corporate_Service"));
+	// --- ADDRESS MAPPING ---
+	accountMap.put("Address",lead.get("Company_Address"));
+	// Billing Address
+	accountMap.put("Billing_Street",ifnull(lead.get("Company_Address"),lead.get("Street")));
+	accountMap.put("Billing_City",lead.get("City"));
+	accountMap.put("Billing_State",lead.get("State"));
+	accountMap.put("Billing_Code",lead.get("Zip_Code"));
+	accountMap.put("Billing_Country",lead.get("Country"));
+	// Shipping Address
+	accountMap.put("Shipping_Street",ifnull(lead.get("Training_Location_Address"),lead.get("Street")));
+	accountMap.put("Shipping_City",lead.get("City"));
+	accountMap.put("Shipping_State",lead.get("State"));
+	accountMap.put("Shipping_Code",lead.get("Zip_Code"));
+	accountMap.put("Shipping_Country",lead.get("Country"));
+	// --- NOTES, TAGS & REMARKS ---
+	accountMap.put("Description",lead.get("Description"));
+	accountMap.put("Remarks",lead.get("Remarks"));
+	accountMap.put("Tag",lead.get("Tag"));
+	// --- RECORD OWNER ASSIGNMENT ---
+	if(lead.get("Owner") != null)
+	{
+		accountMap.put("Owner",lead.get("Owner").get("id"));
+	}
+	// 	2. Create the Account Record
+	search_account = zoho.crm.searchRecords("Accounts","(Email:equals:" + lead.get("Email") + ")");
+	if(search_account != null && search_account.size() > 0)
+	{
+		accountId = search_account.get(0).get("id");
+		update_account = zoho.crm.updateRecord("Accounts",accountId,accountMap);
+		info update_account;
+	}
+	else
+	{
+		createAccountResponse = zoho.crm.createRecord("Accounts",accountMap);
+		info "Account Creation Response: " + createAccountResponse;
+		if(!isnull(createAccountResponse) && createAccountResponse.get("id") != null)
+		{
+			accountId = createAccountResponse.get("id");
+			info accountId;
+		}
+	}
+	//==================related notes========================>
+	if(accountId != "" && accountId != null)
+	{
+		info "aaaaa";
+		leadNotes = zoho.crm.getRelatedRecords("Notes","Leads",leadId);
+		if(!isnull(leadNotes))
+		{
+			accNotes = zoho.crm.getRelatedRecords("Notes","Accounts",accountId.toLong());
+			existingTitles = list();
+			if(!isnull(accNotes))
+			{
+				for each  accNote in accNotes
+				{
+					if(accNote.get("Note_Title") != null)
+					{
+						existingTitles.add(accNote.get("Note_Title").toLowerCase().trim());
+					}
+				}
+			}
+			for each  note in leadNotes
+			{
+				title = note.get("Note_Title");
+				if(title != null)
+				{
+					checkTitle = title.toLowerCase().trim();
+					if(!existingTitles.contains(checkTitle))
+					{
+						noteMap = Map();
+						noteMap.put("Note_Title",title);
+						noteMap.put("Note_Content",note.get("Note_Content"));
+						noteMap.put("Parent_Id",accountId);
+						noteMap.put("$se_module","Accounts");
+						createdNote = zoho.crm.createRecord("Notes",noteMap);
+						info "New Note Created: " + title;
+					}
+					else
+					{
+						info "Duplicate Note Skipped: " + title;
+					}
+				}
+			}
+		}
+		leadAttachments = zoho.crm.getRelatedRecords("Attachments","Leads",leadId);
+		if(!isnull(leadAttachments) && leadAttachments.size() > 0)
+		{
+			accAttachments = zoho.crm.getRelatedRecords("Attachments","Accounts",accountId.toLong());
+			existingFiles = list();
+			if(!isnull(accAttachments))
+			{
+				for each  accFile in accAttachments
+				{
+					if(accFile.get("File_Name") != null)
+					{
+						existingFiles.add(accFile.get("File_Name").toLowerCase().trim());
+					}
+				}
+			}
+			for each  file in leadAttachments
+			{
+				fileId = file.get("$file_id");
+				fileName = file.get("File_Name");
+				if(fileName != null)
+				{
+					checkFile = fileName.toLowerCase().trim();
+					if(!existingFiles.contains(checkFile))
+					{
+						fileData = invokeurl
+						[
+							url :"https://www.zohoapis.com/crm/v3/Leads/" + leadId + "/Attachments/" + fileId
+							type :GET
+							connection:"crm"
+						];
+						if(!isnull(fileData))
+						{
+							if(fileData.isFile() == true)
+							{
+								fileData.setParamName("file");
+							}
+							else
+							{
+								fileData = fileData.toFile(fileName);
+								fileData.setParamName("file");
+							}
+							attachResp = zoho.crm.attachFile("Accounts",accountId.toLong(),fileData);
+							info "Attachment Uploaded: " + fileName + " | Response: " + attachResp;
+						}
+					}
+					else
+					{
+						info "Duplicate Attachment Skipped: " + fileName;
+					}
+				}
+			}
+		}
+	}
+}
+}

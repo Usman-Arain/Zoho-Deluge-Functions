@@ -1,0 +1,40 @@
+string button.Generate_Trainer_Payment_Voucher_2(String recordId)
+{
+info "========================================";
+info "TRAINER VOUCHER GENERATION START";
+info "Record ID: " + recordId;
+info "========================================";
+try 
+{
+	// 1. Specify Zoho Writer Mail Merge Template ID
+	templateId = "gbhgpcf6a******************b1060c3f";
+	// 2. Build parameters
+	params = Map();
+	params.put("record_id",recordId.toString());
+	// 3. Trigger Zoho Writer Merge API using Presets
+	writerResponse = invokeurl
+	[
+		url :"https://www.zohoapis.com/writer/api/v1/documents/" + templateId + "/mergewithpresets"
+		type :POST
+		parameters:params
+		connection:"zohowriter_conn"
+	];
+	info "Writer API Response: " + writerResponse;
+	// 4. Validate API Response
+	if(writerResponse != null && (writerResponse.get("status") == "inprogress" || writerResponse.get("message") != null || writerResponse.get("URL") != null || writerResponse.get("url") != null))
+	{
+		info "SUCCESS: Document merge triggered successfully.";
+		return "Success: Trainer voucher generation triggered successfully!";
+	}
+	else
+	{
+		info "ERROR: Document merge failed or returned unexpected response.";
+		return "Error: Document merge failed. Please check logs for details.";
+	}
+}
+catch (e)
+{
+	info "ERROR EXECUTING MERGE FUNCTION: " + e.toString();
+	return "Error executing function: " + e.toString();
+}
+}
