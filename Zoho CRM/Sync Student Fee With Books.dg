@@ -1,0 +1,331 @@
+void automation.Sync_Student_Fee_With_Books(Int feeID)
+{
+organizationID = "***********";
+// 1. Fetch Fee Collection parent record
+feeRecord = zoho.crm.getRecordById("Fee_Collection",feeID.toLong());
+if(feeRecord.get("id") == null)
+{
+	return;
+}
+existingInvoiceID = ifnull(feeRecord.get("Books_Invoice_ID"),"");
+dueDateVal = feeRecord.get("Due_Date");
+formattedDueDate = "";
+if(dueDateVal != null && dueDateVal != "")
+{
+	formattedDueDate = dueDateVal.toString("yyyy-MM-dd");
+}
+// 2. Fetch Student Books Customer ID
+studentLookup = feeRecord.get("Student_Name");
+if(studentLookup == null)
+{
+	studentLookup = feeRecord.get("Student");
+}
+if(studentLookup == null)
+{
+	return;
+}
+studentID = studentLookup.get("id");
+searchCustomer = zoho.books.getRecords("Contacts",organizationID,"zcrm_contact_id=" + studentID,"zbooks");
+booksCustomerID = "";
+if(searchCustomer.get("code") == 0 && searchCustomer.get("contacts").size() > 0)
+{
+	booksCustomerID = searchCustomer.get("contacts").get(0).get("contact_id");
+}
+// 3. Fetch Course Books Item ID
+courseLookup = feeRecord.get("Course");
+if(courseLookup == null)
+{
+	return;
+}
+courseID = courseLookup.get("id");
+searchItem = zoho.books.getRecords("Items",organizationID,"zcrm_product_id=" + courseID,"zbooks");
+booksItemID = "";
+if(searchItem.get("code") == 0 && searchItem.get("items").size() > 0)
+{
+	booksItemID = searchItem.get("items").get(0).get("item_id");
+}
+// ==============================================================
+// FINANCIAL EXTRACTION & REVERSE TAX CALCULATION
+// ==============================================================
+courseFeePackage = ifnull(feeRecord.get("Course_Fee_Package"),0).toDecimal();
+adjustmentDiscount = ifnull(feeRecord.get("Adjustment_Discount"),0).toDecimal();
+additionalDiscount = ifnull(feeRecord.get("Additional_Discount"),0).toDecimal();
+netPayableFee = ifnull(feeRecord.get("Net_Payable_Fee"),0).toDecimal();
+clientWHT = ifnull(feeRecord.get("Client_WHT_Deduction1"),0).toDecimal();
+sstAmount = ifnull(feeRecord.get("SST_Amount"),0).toDecimal();
+srbSstPercentage = ifnull(feeRecord.get("SRB_SST"),0).toDecimal();
+sstWithheld = 0.0;
+if(srbSstPercentage > 0 && srbSstPercentage < 100)
+{
+	remainingPercentage = (100 - srbSstPercentage) / 100;
+	trueSST = sstAmount / remainingPercentage;
+	sstWithheld = (trueSST * srbSstPercentage / 100).round(2);
+}
+// ==============================================================
+// 4. FETCH ALL REQUIRED LEDGER ACCOUNTS
+// ==============================================================
+accountsUrl = "https://www.zohoapis.com/books/v3/chartofaccounts?organization_id=" + organizationID;
+accountsResp = invokeurl
+[
+	url :accountsUrl
+	type :GET
+	connection:"zbooks"
+];
+undepositedFundsId = "";
+tdsReceivableId = "";
+advanceTaxId = "";
+arAccountId = "";
+discountAccountId = "";
+if(accountsResp.get("code") == 0)
+{
+	for each  acc in accountsResp.get("chartofaccounts")
+	{
+		accName = ifnull(acc.get("account_name"),"");
+		if(accName.equalsIgnoreCase("Undeposited Funds"))
+		{
+			undepositedFundsId = acc.get("account_id");
+		}
+		if(accName.equalsIgnoreCase("TDS Receivable"))
+		{
+			tdsReceivableId = acc.get("account_id");
+		}
+		if(accName.equalsIgnoreCase("Advance Tax"))
+		{
+			advanceTaxId = acc.get("account_id");
+		}
+		if(accName.equalsIgnoreCase("Accounts Receivable"))
+		{
+			arAccountId = acc.get("account_id");
+		}
+		if(accName.equalsIgnoreCase("Discount") || accName.equalsIgnoreCase("Discounts"))
+		{
+			discountAccountId = acc.get("account_id");
+		}
+	}
+}
+// ==============================================================
+// 5. CREATE OR UPDATE INVOICE IN ZOHO BOOKS
+// ==============================================================
+if(existingInvoiceID == "")
+{
+	targetTaxID = "";
+	taxRuleLookup = feeRecord.get("SST_Tax_Rule");
+	if(taxRuleLookup != null)
+	{
+		taxRuleID = taxRuleLookup.get("id");
+		taxMasterRecord = zoho.crm.getRecordById("Tax_Master",taxRuleID.toLong());
+		if(taxMasterRecord != null)
+		{
+			targetTaxID = ifnull(taxMasterRecord.get("Books_Tax_ID"),"");
+		}
+	}
+	lineItemsList = List();
+	lineItem1 = Map();
+	lineItem1.put("item_id",booksItemID);
+	lineItem1.put("rate",courseFeePackage);
+	lineItem1.put("discount",adjustmentDiscount);
+	lineItem1.put("quantity",1);
+	if(targetTaxID != "")
+	{
+		lineItem1.put("tax_id",targetTaxID);
+	}
+	lineItemsList.add(lineItem1);
+	if(additionalDiscount > 0)
+	{
+		lineItem2 = Map();
+		lineItem2.put("name","Additional Discount");
+		lineItem2.put("rate",additionalDiscount * -1);
+		lineItem2.put("quantity",1);
+		if(discountAccountId != "")
+		{
+			lineItem2.put("account_id",discountAccountId);
+		}
+		lineItemsList.add(lineItem2);
+	}
+	invMap = Map();
+	invMap.put("customer_id",booksCustomerID);
+	invMap.put("date",zoho.currentdate.toString("yyyy-MM-dd"));
+	if(formattedDueDate != "")
+	{
+		invMap.put("due_date",formattedDueDate);
+	}
+	invMap.put("line_items",lineItemsList);
+	invResp = zoho.books.createRecord("Invoices",organizationID,invMap,"zbooks");
+	if(invResp.get("code") == 0)
+	{
+		existingInvoiceID = invResp.get("invoice").get("invoice_id");
+		zoho.crm.updateRecord("Fee_Collection",feeID.toLong(),{"Books_Invoice_ID":existingInvoiceID});
+		// FIXED: Mark Invoice as 'Sent' (Open status) so it can instantly receive Journal Credits
+		markSentUrl = "https://www.zohoapis.com/books/v3/invoices/" + existingInvoiceID + "/status/sent?organization_id=" + organizationID;
+		invokeurl
+		[
+			url :markSentUrl
+			type :POST
+			connection:"zbooks"
+		]
+	}
+}
+// ==============================================================
+// 6. PROCESS SUBFORM INSTALLMENTS (JOURNAL CREDITS & PAYMENTS)
+// ==============================================================
+subformRows = feeRecord.get("Installments");
+updatedSubformList = List();
+hasSubformUpdates = false;
+if(subformRows != null && subformRows.size() > 0)
+{
+	for each  row in subformRows
+	{
+		rowId = row.get("id");
+		installmentStatus = ifnull(row.get("Status"),"");
+		existingPaymentID = ifnull(row.get("Books_Payment_ID"),"");
+		rowMap = Map();
+		rowMap.put("id",rowId);
+		if(installmentStatus == "Paid" && existingPaymentID == "")
+		{
+			amountPaid = ifnull(row.get("Amount"),0).toDecimal();
+			if(amountPaid == 0)
+			{
+				amountPaid = ifnull(row.get("Amount_Paid"),0).toDecimal();
+			}
+			paymentRatio = 1.0;
+			if(netPayableFee > 0 && amountPaid < netPayableFee)
+			{
+				paymentRatio = amountPaid / netPayableFee;
+			}
+			appliedWHT = (clientWHT * paymentRatio).round(2);
+			appliedSST = (sstWithheld * paymentRatio).round(2);
+			totalDeductions = appliedWHT + appliedSST;
+			invRespData = zoho.books.getRecordsByID("Invoices",organizationID,existingInvoiceID,"zbooks");
+			invoiceBalance = 0.0;
+			if(invRespData.get("code") == 0)
+			{
+				invoiceBalance = invRespData.get("invoice").get("balance").toDecimal();
+			}
+			netCashAmount = amountPaid;
+			if(paymentRatio >= 0.99 && invoiceBalance > 0)
+			{
+				expectedCashBalance = invoiceBalance - totalDeductions;
+				if(expectedCashBalance > 0)
+				{
+					netCashAmount = expectedCashBalance.round(2);
+				}
+			}
+			payMode = ifnull(row.get("Transaction_Type"),"Cash");
+			payDate = ifnull(row.get("Payment_Date"),zoho.currentdate.toString("yyyy-MM-dd"));
+			newBooksRefID = "";
+			// A. Create AR Credit Journal & Apply directly to Invoice
+			if(totalDeductions > 0 && arAccountId != "")
+			{
+				jLineItems = List();
+				if(appliedWHT > 0 && tdsReceivableId != "")
+				{
+					tdsDebit = Map();
+					tdsDebit.put("account_id",tdsReceivableId);
+					tdsDebit.put("debit_or_credit","debit");
+					tdsDebit.put("amount",appliedWHT);
+					tdsDebit.put("customer_id",booksCustomerID);
+					tdsDebit.put("description","7% WHT deducted by Corporate Client");
+					jLineItems.add(tdsDebit);
+				}
+				if(appliedSST > 0 && advanceTaxId != "")
+				{
+					sstDebit = Map();
+					sstDebit.put("account_id",advanceTaxId);
+					sstDebit.put("debit_or_credit","debit");
+					sstDebit.put("amount",appliedSST);
+					sstDebit.put("customer_id",booksCustomerID);
+					sstDebit.put("description","20% SST withheld by Corporate Client");
+					jLineItems.add(sstDebit);
+				}
+				if(jLineItems.size() > 0)
+				{
+					arCredit = Map();
+					arCredit.put("account_id",arAccountId);
+					arCredit.put("debit_or_credit","credit");
+					arCredit.put("amount",totalDeductions);
+					arCredit.put("customer_id",booksCustomerID);
+					arCredit.put("description","Tax deduction credit applied to invoice");
+					jLineItems.add(arCredit);
+					journalPayload = Map();
+					journalPayload.put("journal_date",payDate);
+					journalPayload.put("reference_number","TAX-DED-" + rowId);
+					journalPayload.put("notes","Tax deduction credit applied to invoice");
+					journalPayload.put("line_items",jLineItems);
+					journalResp = zoho.books.createRecord("journals",organizationID,journalPayload,"zbooks");
+					if(journalResp.get("code") == 0)
+					{
+						newJournalID = journalResp.get("journal").get("journal_id");
+						newBooksRefID = newJournalID;
+						arLineId = "";
+						createdLines = journalResp.get("journal").get("line_items");
+						if(createdLines != null)
+						{
+							for each  jLine in createdLines
+							{
+								if(jLine.get("account_id") == arAccountId && jLine.get("debit_or_credit") == "credit")
+								{
+									arLineId = jLine.get("line_id");
+								}
+							}
+						}
+						if(arLineId != "")
+						{
+							// Apply the Journal Credit Line to the Open Invoice
+							applyPayload = Map();
+							invCreditMap = Map();
+							invCreditMap.put("invoice_id",existingInvoiceID.toLong());
+							invCreditMap.put("amount_applied",totalDeductions.round(2));
+							applyPayload.put("invoices",{invCreditMap});
+							applyUrl = "https://www.zohoapis.com/books/v3/journals/" + newJournalID + "/credits/" + arLineId + "/invoices?organization_id=" + organizationID;
+							invokeurl
+							[
+								url :applyUrl
+								type :POST
+								parameters:{"JSONString":applyPayload.toString()}
+								connection:"zbooks"
+							]
+						}
+					}
+				}
+			}
+			// B. Log Net Cash Received
+			if(netCashAmount > 0)
+			{
+				payMap = Map();
+				payMap.put("customer_id",booksCustomerID);
+				payMap.put("payment_mode",payMode);
+				payMap.put("date",payDate);
+				payMap.put("amount",netCashAmount);
+				if(undepositedFundsId != "")
+				{
+					payMap.put("account_id",undepositedFundsId);
+				}
+				applyInv = Map();
+				applyInv.put("invoice_id",existingInvoiceID);
+				applyInv.put("amount_applied",netCashAmount);
+				payMap.put("invoices",{applyInv});
+				payResp = zoho.books.createRecord("CustomerPayments",organizationID,payMap,"zbooks");
+				if(payResp.get("code") == 0)
+				{
+					if(newBooksRefID == "")
+					{
+						newBooksRefID = payResp.get("payment").get("payment_id");
+					}
+				}
+			}
+			// Update Subform Row with tracking ID
+			if(newBooksRefID != "")
+			{
+				rowMap.put("Books_Payment_ID",newBooksRefID);
+				hasSubformUpdates = true;
+			}
+		}
+		updatedSubformList.add(rowMap);
+	}
+}
+// 7. Write updated subform data back to CRM
+if(hasSubformUpdates)
+{
+	zoho.crm.updateRecord("Fee_Collection",feeID.toLong(),{"Installments":updatedSubformList});
+}
+}

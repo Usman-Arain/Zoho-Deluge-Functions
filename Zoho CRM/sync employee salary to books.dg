@@ -1,0 +1,179 @@
+void automation.sync_employee_salary_journal_to_books(Int salaryID)
+{
+organizationID = "**********";
+// -------------------------------------------------------------
+// STEP 1: FETCH SALARY RECORD FROM CRM
+// -------------------------------------------------------------
+salaryRecord = zoho.crm.getRecordById("Employee_Salary",salaryID.toLong());
+if(salaryRecord.get("id") == null)
+{
+	info "Precheck Failed: Employee Salary record not found.";
+	return;
+}
+// Check if already synced
+existingJournalID = ifnull(salaryRecord.get("Books_Journal_ID"),"");
+if(existingJournalID != "")
+{
+	info "Precheck Stopped: Journal entry already synced with ID: " + existingJournalID;
+	return;
+}
+// -------------------------------------------------------------
+// STEP 2: EXTRACT SALARY AMOUNTS & METADATA
+// -------------------------------------------------------------
+grossSalary = ifnull(salaryRecord.get("Gross_Salary"),0).toDecimal();
+whtAmount = ifnull(salaryRecord.get("Withholding_Tax"),0).toDecimal();
+netPay = ifnull(salaryRecord.get("NET_PAY"),0).toDecimal();
+payoutDate = ifnull(salaryRecord.get("Payout_Date"),zoho.currentdate.toString("yyyy-MM-dd"));
+payMonth = ifnull(salaryRecord.get("Pay_Month"),"");
+payYear = ifnull(salaryRecord.get("Pay_Year"),"");
+if(grossSalary <= 0 || netPay <= 0)
+{
+	info "Precheck Failed: Gross Salary and Net Pay must be greater than zero.";
+	return;
+}
+// -------------------------------------------------------------
+// STEP 3: FETCH LINKED EMPLOYEE & VENDOR ID
+// -------------------------------------------------------------
+empLookup = salaryRecord.get("Employee");
+if(empLookup == null)
+{
+	info "Precheck Failed: No Employee linked to this salary record.";
+	return;
+}
+employeeID = empLookup.get("id");
+empRecord = zoho.crm.getRecordById("Employees",employeeID.toLong());
+empName = ifnull(empRecord.get("Full_Name"),ifnull(empRecord.get("Name"),"Employee"));
+booksVendorID = ifnull(empRecord.get("Books_Employee_ID"),"");
+// Auto-sync employee to Books if vendor ID is missing
+if(booksVendorID == "")
+{
+	info "Vendor ID missing. Running sync_employee_to_books_vendor...";
+	automation.sync_employee_to_books_vendor(employeeID.toLong());
+	updatedEmpRecord = zoho.crm.getRecordById("Employees",employeeID.toLong());
+	booksVendorID = ifnull(updatedEmpRecord.get("Books_Employee_ID"),"");
+	if(booksVendorID == "")
+	{
+		info "Precheck Failed: Unable to retrieve Books Vendor ID for " + empName;
+		return;
+	}
+}
+// -------------------------------------------------------------
+// STEP 4: DYNAMIC ACCOUNT LOOKUP (CHART OF ACCOUNTS)
+// -------------------------------------------------------------
+accountsUrl = "https://www.zohoapis.com/books/v3/chartofaccounts?organization_id=" + organizationID;
+accountsResp = invokeurl
+[
+	url :accountsUrl
+	type :GET
+	connection:"zbooks"
+];
+salaryAccountId = "";
+whtLiabilityAccountId = "";
+clearingAccountId = "";
+if(accountsResp.get("code") == 0 || accountsResp.get("code") == "0")
+{
+	accList = accountsResp.get("chartofaccounts");
+	for each  acc in accList
+	{
+		accName = ifnull(acc.get("account_name"),"");
+		accType = ifnull(acc.get("account_type"),"");
+		accID = ifnull(acc.get("account_id"),"");
+		// 1. Expense Account (Gross Salary Expense)
+		if(accName.equalsIgnoreCase("Salaries and Employee Wages"))
+		{
+			salaryAccountId = accID;
+		}
+		// 2. Liability Account (Withholding Tax Payable)
+		if(accName.containsIgnoreCase("TDS Payable"))
+		{
+			whtLiabilityAccountId = accID;
+		}
+		// 3. Bank / Undeposited Funds / Cash Clearing Account
+		if(accName.equalsIgnoreCase("Undeposited Funds"))
+		{
+			if(clearingAccountId == "")
+			{
+				clearingAccountId = accID;
+			}
+		}
+	}
+}
+if(salaryAccountId == "" || clearingAccountId == "")
+{
+	info "Precheck Failed: Required account IDs (Expense/Bank) missing in Chart of Accounts.";
+	return;
+}
+// -------------------------------------------------------------
+// STEP 5: CONSTRUCT JOURNAL DOUBLE-ENTRY LINES
+// -------------------------------------------------------------
+lineItems = List();
+// Line 1: DEBIT Gross Salary Expense
+debitLine = Map();
+debitLine.put("account_id",salaryAccountId);
+debitLine.put("debit_or_credit","debit");
+debitLine.put("amount",grossSalary);
+debitLine.put("description","Gross salary expense for " + empName + " - " + payMonth + " " + payYear);
+if(booksVendorID != "")
+{
+	debitLine.put("customer_id",booksVendorID);
+}
+lineItems.add(debitLine);
+// Line 2: CREDIT Withholding Tax Liability (if applicable)
+if(whtAmount > 0 && whtLiabilityAccountId != "")
+{
+	taxCreditLine = Map();
+	taxCreditLine.put("account_id",whtLiabilityAccountId);
+	taxCreditLine.put("debit_or_credit","credit");
+	taxCreditLine.put("amount",whtAmount);
+	taxCreditLine.put("description","Withholding tax deducted (7%) - " + empName);
+	if(booksVendorID != "")
+	{
+		taxCreditLine.put("customer_id",booksVendorID);
+	}
+	lineItems.add(taxCreditLine);
+}
+// Line 3: CREDIT Net Pay to Bank / Clearing Account
+bankCreditLine = Map();
+bankCreditLine.put("account_id",clearingAccountId);
+bankCreditLine.put("debit_or_credit","credit");
+bankCreditLine.put("amount",netPay);
+bankCreditLine.put("description","Net salary paid to " + empName);
+if(booksVendorID != "")
+{
+	bankCreditLine.put("customer_id",booksVendorID);
+}
+lineItems.add(bankCreditLine);
+// -------------------------------------------------------------
+// STEP 6: CONSTRUCT JOURNAL PAYLOAD & POST TO ZOHO BOOKS
+// -------------------------------------------------------------
+journalPayload = Map();
+journalPayload.put("journal_date",payoutDate.toString());
+journalPayload.put("reference_number","PAY-" + payMonth + "-" + payYear + "-" + salaryID);
+journalPayload.put("notes","Automated payroll journal entry from CRM for " + empName);
+journalPayload.put("line_items",lineItems);
+createJournalUrl = "https://www.zohoapis.com/books/v3/journals?organization_id=" + organizationID;
+createJournalResp = invokeurl
+[
+	url :createJournalUrl
+	type :POST
+	parameters:journalPayload.toString()
+	connection:"zbooks"
+];
+// -------------------------------------------------------------
+// STEP 7: UPDATE CRM WITH RESULT
+// -------------------------------------------------------------
+if(createJournalResp.get("code") == 0 || createJournalResp.get("code") == "0")
+{
+	newJournalID = createJournalResp.get("journal").get("journal_id");
+	crmUpdate = Map();
+	crmUpdate.put("Books_Journal_ID",newJournalID);
+	crmUpdate.put("Books_Sync_Status","Synced as Journal");
+	zoho.crm.updateRecord("Employee_Salary",salaryID.toLong(),crmUpdate);
+	info "Successfully created Payroll Journal Entry in Books. Journal ID: " + newJournalID;
+}
+else
+{
+	info "Failed to create Journal Entry in Books: " + createJournalResp;
+	zoho.crm.updateRecord("Employee_Salary",salaryID.toLong(),{"Books_Sync_Status":"Journal Sync Error"});
+}
+}
